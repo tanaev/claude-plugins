@@ -1,0 +1,871 @@
+#!/usr/bin/env python3
+"""Home Assistant CLI for Claude: cached inventory + live state/control via REST API.
+
+Workspace: $HA_HOME or ~/HomeAssistant
+  config.json   {"url": "...", "ssh_host": "...", "config_dir": "/config"}
+  notes.md      the user's own facts (aliases, quirks, preferences)
+  data/         cache (inventory.json, inventory.md, summary.md, services.json), backups
+  config/       local mirror of HA's YAML files (pull -> edit -> push)
+  dashboards/   pulled dashboard configs (JSON)
+Token: env HA_TOKEN, else macOS Keychain / libsecret (service "home-assistant"),
+       else <workspace>/.token (mode 600).
+"""
+import argparse
+import base64
+import datetime as dt
+import difflib
+import getpass
+import json
+import os
+import shlex
+import shutil
+import socket
+import ssl
+import struct
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(os.environ.get("HA_HOME") or "~/HomeAssistant").expanduser()
+DASHBOARDS = ROOT / "dashboards"   # pulled dashboard configs (JSON)
+DASH_BASELINE = ROOT / "data" / "dash_baseline"
+TOKEN_FILE = ROOT / ".token"       # fallback when no OS keyring is available
+NOTES = ROOT / "notes.md"
+CONFIG = ROOT / "config.json"
+DATA = ROOT / "data"
+INVENTORY = DATA / "inventory.json"
+INVENTORY_MD = DATA / "inventory.md"
+SUMMARY_MD = DATA / "summary.md"
+SERVICES = DATA / "services.json"
+KEYCHAIN_SERVICE = "home-assistant"
+CACHE_TTL = 24 * 3600
+MIRROR = ROOT / "config"           # editable local copy of HA's YAML
+BASELINE = DATA / "baseline"       # what the remote looked like at last pull/push
+BACKUPS = DATA / "backups"         # remote versions overwritten by push
+# secrets.yaml and zigbee2mqtt/ (add-on config with MQTT creds + network key) are never pulled
+# so secrets don't end up in Claude's context.
+PULL_FIND = (
+    "find . \\( -name .storage -o -name custom_components -o -name deps -o -name www -o -name tts"
+    " -o -name .git -o -name node_modules -o -name .esphome -o -name .cloud -o -name backups -o -name zigbee2mqtt \\) -prune"
+    " -o -type f \\( -name '*.yaml' -o -name '*.yml' -o -name '*.jinja' \\) ! -name secrets.yaml -print"
+)
+# File -> service that applies it without restart.
+RELOADERS = {
+    "automations.yaml": "automation.reload",
+    "scripts.yaml": "script.reload",
+    "scenes.yaml": "scene.reload",
+    "groups.yaml": "group.reload",
+}
+
+# Adds area/floor/device, which plain /api/states lacks. HA caps template output at 256 KB,
+# so it's rendered per chunk of entity ids (IDS_JSON is substituted in).
+INVENTORY_TEMPLATE = """
+{%- for s in states | selectattr('entity_id', 'in', IDS_JSON) -%}
+{%- set d = device_id(s.entity_id) -%}
+{{ {
+  "id": s.entity_id,
+  "name": s.name,
+  "area": area_name(s.entity_id),
+  "floor": floor_name(s.entity_id),
+  "device": (device_attr(d, 'name_by_user') or device_attr(d, 'name')) if d else none,
+  "model": ((device_attr(d, 'manufacturer') or '') ~ ' ' ~ (device_attr(d, 'model') or '')) | trim if d else none,
+  "labels": labels(s.entity_id) | map('label_name') | list,
+  "device_class": s.attributes.get("device_class"),
+  "unit": s.attributes.get("unit_of_measurement"),
+} | tojson }}
+{% endfor -%}
+"""
+
+
+def die(msg):
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def load_config():
+    if not CONFIG.exists():
+        die(f"not configured (no {CONFIG}); ask Claude to run /home-assistant:setup")
+    return json.loads(CONFIG.read_text())
+
+
+def keyring_cmd(action, token=None):
+    """OS keyring command for get/set, or None when there is none."""
+    acct = str(ROOT)  # one token per workspace
+    if sys.platform == "darwin":
+        if action == "get":
+            return ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", acct, "-w"]
+        return ["security", "add-generic-password", "-U", "-s", KEYCHAIN_SERVICE, "-a", acct, "-w", token]
+    if shutil.which("secret-tool"):
+        if action == "get":
+            return ["secret-tool", "lookup", "service", KEYCHAIN_SERVICE, "account", acct]
+        return ["secret-tool", "store", "--label", "Home Assistant token", "service", KEYCHAIN_SERVICE, "account", acct]
+    return None
+
+
+def get_token():
+    if os.environ.get("HA_TOKEN"):
+        return os.environ["HA_TOKEN"]
+    cmd = keyring_cmd("get")
+    if cmd:
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    if TOKEN_FILE.exists():
+        return TOKEN_FILE.read_text().strip()
+    die("no token saved; ask Claude to run /home-assistant:setup")
+
+
+def save_token(token):
+    cmd = keyring_cmd("set", token)
+    if cmd:
+        # secret-tool reads the secret from stdin
+        r = subprocess.run(cmd, input=token if cmd[0] == "secret-tool" else None, capture_output=True, text=True)
+        if r.returncode == 0:
+            TOKEN_FILE.unlink(missing_ok=True)
+            return "OS keyring"
+    TOKEN_FILE.write_text(token + "\n")
+    TOKEN_FILE.chmod(0o600)
+    return str(TOKEN_FILE)
+
+
+def read_clipboard():
+    for cmd in (["pbpaste"], ["wl-paste", "--no-newline"], ["xclip", "-o", "-selection", "clipboard"],
+                ["xsel", "--clipboard", "--output"], ["powershell.exe", "-NoProfile", "-Command", "Get-Clipboard"]):
+        if shutil.which(cmd[0]):
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if r.returncode == 0:
+                return r.stdout.strip()
+    die("cannot read the clipboard (no pbpaste/wl-paste/xclip/xsel); use --token-stdin")
+
+
+def request(method, path, body=None, raw=False, timeout=30, fatal=True):
+    url = load_config()["url"].rstrip("/") + path
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method, headers={
+        "Authorization": f"Bearer {get_token()}",
+        "Content-Type": "application/json",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            text = resp.read().decode()
+    except urllib.error.HTTPError as e:
+        e.body = e.read().decode()
+        if not fatal:
+            raise
+        die(f"{method} {path} -> HTTP {e.code}: {e.body[:500]}")
+    except urllib.error.URLError as e:
+        die(f"cannot reach {url}: {e.reason}")
+    return text if raw else (json.loads(text) if text else None)
+
+
+# ---------- cache ----------
+
+def load_inventory(auto_sync=True):
+    if auto_sync and (not INVENTORY.exists() or time.time() - INVENTORY.stat().st_mtime > CACHE_TTL):
+        sync(quiet=True)
+    if not INVENTORY.exists():
+        die("no inventory; run `ha sync`")
+    return json.loads(INVENTORY.read_text())
+
+
+def fetch_inventory(ids, chunk=300):
+    entities = []
+    i = 0
+    while i < len(ids):
+        part = ids[i:i + chunk]
+        tpl = INVENTORY_TEMPLATE.replace("IDS_JSON", json.dumps(part))
+        try:
+            text = request("POST", "/api/template", {"template": tpl}, raw=True, timeout=120, fatal=False)
+        except urllib.error.HTTPError as e:
+            if e.code == 400 and chunk > 10 and "maximum size" in e.body:
+                chunk //= 2
+                continue
+            die(f"POST /api/template -> HTTP {e.code}: {e.body[:500]}")
+        entities += [json.loads(line) for line in text.splitlines() if line.strip()]
+        i += len(part)
+    return entities
+
+
+def sync(quiet=False):
+    ids = sorted(s["entity_id"] for s in request("GET", "/api/states", timeout=60))
+    entities = fetch_inventory(ids)
+    entities.sort(key=lambda e: e["id"])
+    old = {e["id"] for e in json.loads(INVENTORY.read_text())["entities"]} if INVENTORY.exists() else set()
+    new = {e["id"] for e in entities}
+
+    services = request("GET", "/api/services")
+    cfg = request("GET", "/api/config")
+
+    DATA.mkdir(parents=True, exist_ok=True)
+    meta = {
+        "synced_at": dt.datetime.now().isoformat(timespec="seconds"),
+        "ha_version": cfg.get("version"),
+        "location": cfg.get("location_name"),
+        "entities": entities,
+    }
+    INVENTORY.write_text(json.dumps(meta, ensure_ascii=False, indent=1))
+    SERVICES.write_text(json.dumps(services, ensure_ascii=False, indent=1))
+    INVENTORY_MD.write_text(render_md(meta, services))
+    SUMMARY_MD.write_text(render_summary(meta))
+
+    added, removed = sorted(new - old), sorted(old - new)
+    summary = f"synced {len(entities)} entities (HA {cfg.get('version')})"
+    if old:
+        summary += f"; +{len(added)} -{len(removed)}"
+    print(summary)
+    if not quiet and old:
+        for e in added:
+            print(f"  + {e}")
+        for e in removed:
+            print(f"  - {e}")
+
+
+def render_summary(meta):
+    """Small overview (rooms -> devices) meant to be read whole; details live in inventory.md."""
+    areas = {}
+    for e in meta["entities"]:
+        a = areas.setdefault((e["floor"] or "", e["area"] or "(no area)"), {"devices": {}, "loose": []})
+        if e["device"]:
+            a["devices"].setdefault(e["device"], set()).add(e["id"].split(".")[0])
+        elif e["id"].split(".")[0] not in ("automation", "zone", "person", "sun", "conversation", "update"):
+            a["loose"].append(e["id"])
+    lines = [f"# Home overview — {meta['location']} ({len(meta['entities'])} entities, synced {meta['synced_at']})",
+             "Device -> its entity domains. Find exact ids: `ha find <words>` or grep data/inventory.md.", ""]
+    for (floor, area), a in sorted(areas.items(), key=lambda x: (x[0][1] == "(no area)", x[0])):
+        lines.append(f"## {area}" + (f" ({floor})" if floor else ""))
+        for dev, doms in sorted(a["devices"].items()):
+            lines.append(f"- {dev}: {', '.join(sorted(doms))}")
+        if a["loose"]:
+            lines.append(f"- no device: {', '.join(sorted(a['loose']))}")
+        lines.append("")
+    autos = [e["name"] for e in meta["entities"] if e["id"].startswith("automation.")]
+    if autos:
+        lines.append("## Automations")
+        lines += [f"- {n}" for n in sorted(autos)]
+    return "\n".join(lines) + "\n"
+
+
+def render_md(meta, services):
+    by_area = {}
+    for e in meta["entities"]:
+        key = (e["floor"] or "", e["area"] or "(no area)")
+        by_area.setdefault(key, []).append(e)
+    counts = {}
+    for e in meta["entities"]:
+        d = e["id"].split(".")[0]
+        counts[d] = counts.get(d, 0) + 1
+
+    lines = [
+        f"# Home Assistant inventory — {meta['location']}",
+        f"Synced {meta['synced_at']}, HA {meta['ha_version']}, {len(meta['entities'])} entities. "
+        "States are NOT cached — use `ha state`.",
+        "",
+        "Domains: " + ", ".join(f"{d} {n}" for d, n in sorted(counts.items(), key=lambda x: -x[1])),
+        "",
+    ]
+    for (floor, area), ents in sorted(by_area.items(), key=lambda x: (x[0][1] == "(no area)", x[0])):
+        lines.append(f"## {area}" + (f" ({floor})" if floor else ""))
+        for e in ents:
+            extra = [x for x in (e["device_class"], e["unit"]) if x]
+            if e["labels"]:
+                extra.append("labels: " + ",".join(e["labels"]))
+            dev = f" [{e['device']}]" if e["device"] and e["device"] != e["name"] else ""
+            lines.append(f"- `{e['id']}` {e['name']}{dev}" + (f" ({'; '.join(extra)})" if extra else ""))
+        lines.append("")
+    lines.append("## Services")
+    for s in sorted(services, key=lambda s: s["domain"]):
+        lines.append(f"- {s['domain']}: {', '.join(sorted(s['services']))}")
+    return "\n".join(lines) + "\n"
+
+
+# ---------- queries ----------
+
+def match(e, terms):
+    hay = " ".join(str(v) for v in (e["id"], e["name"], e["area"], e["floor"], e["device"], e["model"],
+                                       " ".join(e["labels"]))).lower()
+    return all(t.lower() in hay for t in terms)
+
+
+def select(args, inv):
+    ents = inv["entities"]
+    if getattr(args, "domain", None):
+        ents = [e for e in ents if e["id"].split(".")[0] == args.domain]
+    if getattr(args, "area", None):
+        ents = [e for e in ents if args.area.lower() in (e["area"] or "").lower()]
+    return ents
+
+
+def cmd_find(args):
+    inv = load_inventory()
+    ents = [e for e in select(args, inv) if match(e, args.query)]
+    for e in ents[: args.limit]:
+        loc = e["area"] or "-"
+        dev = f" [{e['device']}]" if e["device"] else ""
+        print(f"{e['id']}\t{e['name']}\t{loc}{dev}")
+    if len(ents) > args.limit:
+        print(f"... {len(ents) - args.limit} more (use --limit)")
+
+
+def local_time(iso):
+    return dt.datetime.fromisoformat(iso).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def fmt_state(s, verbose):
+    a = s["attributes"]
+    unit = a.get("unit_of_measurement", "")
+    line = f"{s['entity_id']}\t{s['state']}{(' ' + unit) if unit else ''}\t{a.get('friendly_name', '')}"
+    line += f"\t(changed {local_time(s['last_changed'])})"
+    if verbose:
+        skip = {"friendly_name", "unit_of_measurement", "icon", "entity_picture", "supported_features",
+                "supported_color_modes"}
+        extra = {k: v for k, v in a.items() if k not in skip}
+        if extra:
+            line += "\n    " + json.dumps(extra, ensure_ascii=False)
+    return line
+
+
+def cmd_state(args):
+    if args.entities and not (args.area or args.domain):
+        for eid in args.entities:
+            try:
+                print(fmt_state(request("GET", f"/api/states/{eid}", fatal=False), args.verbose))
+            except urllib.error.HTTPError as e:
+                if e.code != 404:
+                    die(f"GET /api/states/{eid} -> HTTP {e.code}: {e.body[:500]}")
+                print(f"{eid}\tNOT FOUND")
+        return
+    inv = load_inventory()
+    wanted = {e["id"] for e in select(args, inv) if not args.entities or match(e, args.entities)}
+    if not wanted:
+        die("nothing matched")
+    for s in request("GET", "/api/states"):
+        if s["entity_id"] in wanted:
+            print(fmt_state(s, args.verbose))
+
+
+def cmd_call(args):
+    domain, service = args.service.split(".", 1)
+    body = json.loads(args.data) if args.data else {}
+    if args.entities:
+        body["entity_id"] = args.entities
+    q = "?return_response" if args.response else ""
+    res = request("POST", f"/api/services/{domain}/{service}{q}", body)
+    if args.response:
+        print(json.dumps(res, ensure_ascii=False, indent=1))
+    else:
+        changed = res if isinstance(res, list) else []
+        print(f"ok; {len(changed)} state(s) changed")
+        for s in changed:
+            print(fmt_state(s, False))
+
+
+def cmd_services(args):
+    services = json.loads(SERVICES.read_text()) if SERVICES.exists() else request("GET", "/api/services")
+    for s in services:
+        if args.domain and s["domain"] != args.domain:
+            continue
+        if args.domain:
+            for name, spec in sorted(s["services"].items()):
+                fields = ", ".join(spec.get("fields", {}).keys())
+                print(f"{s['domain']}.{name}({fields})  {spec.get('description', '')[:80]}")
+        else:
+            print(f"{s['domain']}: {', '.join(sorted(s['services']))}")
+
+
+def cmd_history(args):
+    start = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=args.hours)).isoformat()
+    q = urllib.parse.urlencode({"filter_entity_id": ",".join(args.entities),
+                                "end_time": dt.datetime.now(dt.timezone.utc).isoformat(),  # default is start+1d
+                                "minimal_response": "", "no_attributes": ""})
+    res = request("GET", f"/api/history/period/{urllib.parse.quote(start)}?{q}")
+    for series in res:
+        if not series:
+            continue
+        eid = series[0]["entity_id"]
+        print(f"# {eid} ({len(series)} points)")
+        pts = series if len(series) <= args.max else series[:: max(1, len(series) // args.max)]
+        for p in pts:
+            print(f"{local_time(p['last_changed'])}\t{p['state']}")
+
+
+def cmd_logbook(args):
+    start = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=args.hours)).isoformat()
+    q = f"?entity={args.entity}" if args.entity else ""
+    for e in request("GET", f"/api/logbook/{urllib.parse.quote(start)}{q}")[-args.max:]:
+        print(f"{local_time(e['when'])}\t{e.get('entity_id', '')}\t{e.get('name', '')} "
+              f"{e.get('message', '') or e.get('state', '')}")
+
+
+def cmd_template(args):
+    print(request("POST", "/api/template", {"template": args.template}, raw=True))
+
+
+def cmd_api(args):
+    body = json.loads(args.body) if args.body else None
+    print(json.dumps(request(args.method.upper(), args.path, body), ensure_ascii=False, indent=1))
+
+
+def cmd_check(args):
+    cfg = load_config()
+    print(f"url: {cfg['url']}")
+    print(request("GET", "/api/")["message"])
+    print("config check:", request("POST", "/api/config/core/check_config").get("result"))
+    if INVENTORY.exists():
+        inv = json.loads(INVENTORY.read_text())
+        print(f"cache: {len(inv['entities'])} entities, synced {inv['synced_at']}")
+
+
+def ssh(cmd, input=None, check=True):
+    cfg = load_config()
+    if not cfg.get("ssh_host"):
+        die("ssh_host not configured; YAML editing needs SSH, see /home-assistant:setup")
+    r = subprocess.run(["ssh", "-o", "BatchMode=yes", cfg["ssh_host"], cmd], input=input, capture_output=True)
+    if check and r.returncode != 0:
+        die(f"ssh failed: {r.stderr.decode().strip()}")
+    return r
+
+
+def remote_path(rel):
+    return shlex.quote(load_config().get("config_dir", "/config").rstrip("/") + "/" + rel)
+
+
+def read_remote(rel):
+    r = ssh(f"cat {remote_path(rel)}", check=False)
+    return r.stdout if r.returncode == 0 else None
+
+
+def local_files(base):
+    return {str(p.relative_to(base)) for p in base.rglob("*") if p.is_file()} if base.exists() else set()
+
+
+def changed_files():
+    """Files edited/added in the mirror since the last pull/push."""
+    out = []
+    for rel in sorted(local_files(MIRROR)):
+        base = BASELINE / rel
+        if not base.exists() or base.read_bytes() != (MIRROR / rel).read_bytes():
+            out.append(rel)
+    return out
+
+
+def cmd_pull(args):
+    pending = changed_files()
+    if pending and not args.force:
+        die("unpushed local edits (push them or use --force to discard): " + ", ".join(pending))
+    cfg_dir = shlex.quote(load_config().get("config_dir", "/config"))
+    tarball = ssh(f"cd {cfg_dir} && {PULL_FIND} | tar czf - -T -").stdout
+    for d in (MIRROR, BASELINE):
+        if d.exists():
+            shutil.rmtree(d)
+        d.mkdir(parents=True)
+        subprocess.run(["tar", "xzf", "-", "-C", str(d)], input=tarball, check=True)
+    files = sorted(local_files(MIRROR))
+    print(f"pulled {len(files)} files into {MIRROR}")
+    for f in files:
+        print(f"  {f}")
+
+
+def cmd_diff(args):
+    files = args.files or changed_files()
+    if not files:
+        print("no local changes")
+    for rel in files:
+        old = (BASELINE / rel).read_text().splitlines(keepends=True) if (BASELINE / rel).exists() else []
+        new = (MIRROR / rel).read_text().splitlines(keepends=True)
+        sys.stdout.writelines(difflib.unified_diff(old, new, f"remote/{rel}", f"local/{rel}"))
+
+
+def check_config():
+    res = request("POST", "/api/config/core/check_config", timeout=120)
+    return res.get("result") == "valid", res.get("errors")
+
+
+def cmd_push(args):
+    files = args.files or changed_files()
+    if not files:
+        print("nothing to push")
+        return
+    # Refuse if someone (e.g. the HA UI) changed the remote file since our pull.
+    remote = {rel: read_remote(rel) for rel in files}
+    for rel in files:
+        base = BASELINE / rel
+        expected = base.read_bytes() if base.exists() else None
+        if remote[rel] != expected:
+            die(f"{rel} changed on HA since last pull; run `ha pull --force` and re-apply edits")
+
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    for rel in files:
+        if remote[rel] is not None:
+            bak = BACKUPS / stamp / rel
+            bak.parent.mkdir(parents=True, exist_ok=True)
+            bak.write_bytes(remote[rel])
+
+    def upload(rel, content):
+        ssh(f"sudo mkdir -p $(dirname {remote_path(rel)}) && sudo tee {remote_path(rel)} >/dev/null", input=content)
+
+    for rel in files:
+        upload(rel, (MIRROR / rel).read_bytes())
+    ok, errors = check_config()
+    if not ok:
+        for rel in files:
+            if remote[rel] is not None:
+                upload(rel, remote[rel])
+            else:
+                ssh(f"sudo rm -f {remote_path(rel)}")
+        die(f"config check failed, remote restored:\n{errors}")
+
+    for rel in files:
+        dst = BASELINE / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(MIRROR / rel, dst)
+    print(f"pushed {len(files)} file(s), config valid; backup in {BACKUPS / stamp}")
+
+    reloads = {RELOADERS[Path(f).name] for f in files if Path(f).name in RELOADERS}
+    others = [f for f in files if Path(f).name not in RELOADERS]
+    if args.no_reload:
+        reloads = set()
+    for svc in sorted(reloads):
+        domain, service = svc.split(".")
+        request("POST", f"/api/services/{domain}/{service}", {})
+        print(f"reloaded: {svc}")
+    if others:
+        print("not auto-applied: " + ", ".join(others) +
+              "\n  -> try `ha call homeassistant.reload_all`; some integrations need `ha call homeassistant.restart`")
+
+
+def cmd_ls_remote(args):
+    cfg_dir = shlex.quote(load_config().get("config_dir", "/config"))
+    sys.stdout.write(ssh(f"cd {cfg_dir} && ls -la {shlex.quote(args.path)}").stdout.decode())
+
+
+class WS:
+    """Minimal stdlib WebSocket client for HA's /api/websocket (dashboards have no REST API)."""
+
+    def __init__(self):
+        u = urllib.parse.urlparse(load_config()["url"])
+        port = u.port or (443 if u.scheme == "https" else 80)
+        sock = socket.create_connection((u.hostname, port), timeout=30)
+        if u.scheme == "https":
+            sock = ssl.create_default_context().wrap_socket(sock, server_hostname=u.hostname)
+        self.sock, self.buf, self.next_id = sock, b"", 1
+        key = base64.b64encode(os.urandom(16)).decode()
+        sock.sendall((f"GET /api/websocket HTTP/1.1\r\nHost: {u.hostname}\r\nUpgrade: websocket\r\n"
+                      f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+        while b"\r\n\r\n" not in self.buf:
+            self.buf += self._recv()
+        head, self.buf = self.buf.split(b"\r\n\r\n", 1)
+        if b" 101 " not in head.split(b"\r\n")[0]:
+            die(f"websocket handshake failed: {head.splitlines()[0].decode()}")
+        self.recv_json()  # auth_required
+        self.send_json({"type": "auth", "access_token": get_token()})
+        if self.recv_json().get("type") != "auth_ok":
+            die("websocket auth failed")
+
+    def _recv(self):
+        chunk = self.sock.recv(65536)
+        if not chunk:
+            die("websocket closed")
+        return chunk
+
+    def _read(self, n):
+        while len(self.buf) < n:
+            self.buf += self._recv()
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+    def send_json(self, obj):
+        data = json.dumps(obj).encode()
+        n = len(data)
+        head = bytes([0x81]) + (bytes([0x80 | n]) if n < 126 else
+                               bytes([0x80 | 126]) + struct.pack(">H", n) if n < 65536 else
+                               bytes([0x80 | 127]) + struct.pack(">Q", n))
+        mask = os.urandom(4)
+        self.sock.sendall(head + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+    def recv_json(self):
+        payload = b""
+        while True:
+            b1, b2 = self._read(2)
+            n = b2 & 0x7F
+            if n == 126:
+                n = struct.unpack(">H", self._read(2))[0]
+            elif n == 127:
+                n = struct.unpack(">Q", self._read(8))[0]
+            data = self._read(n)
+            op = b1 & 0x0F
+            if op == 9:  # ping -> pong
+                self.sock.sendall(bytes([0x8A, 0x80 | len(data)]) + b"\0\0\0\0" + data)
+                continue
+            if op == 8:
+                die("websocket closed by server")
+            payload += data
+            if b1 & 0x80:
+                return json.loads(payload)
+
+    def call(self, **msg):
+        msg["id"] = self.next_id
+        self.next_id += 1
+        self.send_json(msg)
+        while True:
+            res = self.recv_json()
+            if res.get("id") == msg["id"]:
+                if not res.get("success"):
+                    die(f"{msg['type']} failed: {res.get('error')}")
+                return res.get("result")
+
+
+def dash_name(url_path):
+    return url_path or "lovelace"
+
+
+def dash_arg(name):
+    return None if name in (None, "lovelace") else name
+
+
+def cmd_dash_list(args):
+    for d in WS().call(type="lovelace/dashboards/list"):
+        print(f"{d['url_path']}\t{d.get('title', '')}\t{d.get('mode', '')}")
+
+
+def cmd_dash_pull(args):
+    name = dash_name(args.name)
+    local, base = DASHBOARDS / f"{name}.json", DASH_BASELINE / f"{name}.json"
+    if local.exists() and base.exists() and local.read_text() != base.read_text() and not args.force:
+        die(f"unpushed edits in {local} (push them or use --force)")
+    cfg = WS().call(type="lovelace/config", url_path=dash_arg(name))
+    text = json.dumps(cfg, ensure_ascii=False, indent=2) + "\n"
+    for f in (local, base):
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(text)
+    print(f"pulled dashboard '{name}' -> {local} ({len(cfg.get('views', []))} views)")
+
+
+def dash_diff_text(name):
+    local, base = DASHBOARDS / f"{name}.json", DASH_BASELINE / f"{name}.json"
+    return "".join(difflib.unified_diff(base.read_text().splitlines(keepends=True),
+                                        local.read_text().splitlines(keepends=True),
+                                        f"remote/{name}", f"local/{name}"))
+
+
+def cmd_dash_diff(args):
+    print(dash_diff_text(dash_name(args.name)) or "no local changes")
+
+
+def cmd_dash_push(args):
+    name = dash_name(args.name)
+    local, base = DASHBOARDS / f"{name}.json", DASH_BASELINE / f"{name}.json"
+    if not base.exists():
+        die(f"pull '{name}' first")
+    new = json.loads(local.read_text())
+    ws = WS()
+    remote = ws.call(type="lovelace/config", url_path=dash_arg(name))
+    if remote != json.loads(base.read_text()):
+        die(f"dashboard '{name}' changed in HA since pull; `ha dashboard pull {name} --force` and re-apply")
+    if new == remote:
+        print("nothing to push")
+        return
+    bak = BACKUPS / dt.datetime.now().strftime("%Y%m%d-%H%M%S") / f"dashboard-{name}.json"
+    bak.parent.mkdir(parents=True, exist_ok=True)
+    bak.write_text(json.dumps(remote, ensure_ascii=False, indent=2))
+    ws.call(type="lovelace/config/save", url_path=dash_arg(name), config=new)
+    shutil.copyfile(local, base)
+    print(f"saved dashboard '{name}'; previous version in {bak}")
+
+
+def cmd_ws(args):
+    msg = json.loads(args.body) if args.body else {}
+    print(json.dumps(WS().call(type=args.type, **msg), ensure_ascii=False, indent=1))
+
+
+NOTES_TEMPLATE = """# Home notes
+
+Things about the house that Home Assistant itself doesn't know: aliases, what a
+switch actually controls, habits, quirks. Claude reads this before acting and
+appends here when the user says "remember ...".
+
+## Aliases
+<!-- - "бойлер" = switch.boiler_relay -->
+
+## Devices & quirks
+
+## Preferences
+"""
+
+
+def cmd_setup(args):
+    """Non-interactive when --url and a token source are given, so Claude can run it."""
+    ROOT.mkdir(parents=True, exist_ok=True)
+    cfg = json.loads(CONFIG.read_text()) if CONFIG.exists() else {}
+    url = args.url or cfg.get("url")
+    if not url and sys.stdin.isatty():
+        url = input("HA URL [http://homeassistant.local:8123]: ").strip() or "http://homeassistant.local:8123"
+    if not url:
+        die("pass --url")
+    cfg["url"] = url.rstrip("/")
+    if args.ssh_host is not None:
+        cfg["ssh_host"] = args.ssh_host
+    if args.config_dir:
+        cfg["config_dir"] = args.config_dir
+
+    token = None
+    if args.token_from_clipboard:
+        token = read_clipboard()
+    elif args.token_stdin:
+        token = sys.stdin.readline().strip()
+    elif sys.stdin.isatty():
+        token = getpass.getpass("Long-lived access token (Enter = keep existing): ").strip()
+    if token:
+        if token.count(".") != 2:
+            die("that doesn't look like a long-lived access token (expected a JWT: xxx.yyy.zzz)")
+        os.environ["HA_TOKEN"] = token  # validate before saving
+    CONFIG.write_text(json.dumps(cfg, indent=1) + "\n")
+    try:
+        msg = request("GET", "/api/", fatal=False)["message"]
+    except urllib.error.HTTPError as e:
+        die(f"HA answered HTTP {e.code} at {cfg['url']}" + (" (token rejected)" if e.code == 401 else ""))
+    print(f"connected: {cfg['url']} ({msg})")
+    if token:
+        print("token saved to", save_token(token))
+        os.environ.pop("HA_TOKEN")
+    if not NOTES.exists():
+        NOTES.write_text(NOTES_TEMPLATE)
+    print("workspace:", ROOT)
+    sync()
+
+
+def cmd_doctor(args):
+    """Report what is configured and working, one line per check."""
+    ok = lambda b: "ok " if b else "-- "
+    print(ok(CONFIG.exists()), "config", CONFIG)
+    if not CONFIG.exists():
+        print("not configured yet: run /home-assistant:setup in Claude Code")
+        return
+    cfg = load_config()
+    try:
+        get_token_ok = bool(get_token())
+    except SystemExit:
+        get_token_ok = False
+    print(ok(get_token_ok), "token")
+    try:
+        msg = request("GET", "/api/", fatal=False)["message"]
+        print(ok(True), "api", cfg["url"], msg)
+    except Exception as e:
+        print(ok(False), "api", cfg["url"], getattr(e, "code", "") or e)
+    if cfg.get("ssh_host"):
+        r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", cfg["ssh_host"],
+                            f"ls {shlex.quote(cfg.get('config_dir', '/config'))}/configuration.yaml"],
+                           capture_output=True, text=True)
+        print(ok(r.returncode == 0), "ssh", cfg["ssh_host"], (r.stderr.strip().splitlines() or [""])[-1])
+    else:
+        print(ok(False), "ssh not configured (optional: needed only for YAML pull/push)")
+    print(ok(INVENTORY.exists()), "inventory", INVENTORY)
+    print(ok(NOTES.exists()), "notes", NOTES)
+
+
+def main():
+    p = argparse.ArgumentParser(prog="ha", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("setup", help="configure URL + token, verify, first sync")
+    s.add_argument("--url")
+    s.add_argument("--ssh-host", help="ssh config host alias for HA config access ('' to unset)")
+    s.add_argument("--config-dir", help="HA config dir on the ssh host (default /config)")
+    s.add_argument("--token-from-clipboard", action="store_true", help="read the token from the clipboard")
+    s.add_argument("--token-stdin", action="store_true", help="read the token from stdin")
+    s.set_defaults(fn=cmd_setup)
+
+    s = sub.add_parser("doctor", help="show what is configured and working")
+    s.set_defaults(fn=cmd_doctor)
+
+    s = sub.add_parser("sync", help="refresh cached inventory, show added/removed entities")
+    s.set_defaults(fn=lambda a: sync())
+
+    s = sub.add_parser("pull", help="download HA YAML files (except secrets.yaml) into the local mirror")
+    s.add_argument("--force", action="store_true", help="discard unpushed local edits")
+    s.set_defaults(fn=cmd_pull)
+
+    s = sub.add_parser("diff", help="local mirror edits vs HA")
+    s.add_argument("files", nargs="*")
+    s.set_defaults(fn=cmd_diff)
+
+    s = sub.add_parser("push", help="upload edited files, validate config (rollback on error), reload")
+    s.add_argument("files", nargs="*", help="default: all changed files")
+    s.add_argument("--no-reload", action="store_true")
+    s.set_defaults(fn=cmd_push)
+
+    s = sub.add_parser("ls", help="list a directory under HA config dir via ssh")
+    s.add_argument("path", nargs="?", default=".")
+    s.set_defaults(fn=cmd_ls_remote)
+
+    s = sub.add_parser("dashboard", help="UI dashboards: list | pull | diff | push [name] (default: lovelace)")
+    s.add_argument("action", choices=["list", "pull", "diff", "push"])
+    s.add_argument("name", nargs="?")
+    s.add_argument("--force", action="store_true")
+    s.set_defaults(fn=lambda a: {"list": cmd_dash_list, "pull": cmd_dash_pull,
+                                 "diff": cmd_dash_diff, "push": cmd_dash_push}[a.action](a))
+
+    s = sub.add_parser("ws", help="raw WebSocket command, e.g. `ha ws config/entity_registry/get '{\"entity_id\":\"light.x\"}'`")
+    s.add_argument("type")
+    s.add_argument("body", nargs="?")
+    s.set_defaults(fn=cmd_ws)
+
+    s = sub.add_parser("check", help="connectivity + config check")
+    s.set_defaults(fn=cmd_check)
+
+    s = sub.add_parser("find", help="search cached inventory (no network unless cache stale)")
+    s.add_argument("query", nargs="*")
+    s.add_argument("--domain", "-d")
+    s.add_argument("--area", "-a")
+    s.add_argument("--limit", type=int, default=50)
+    s.set_defaults(fn=cmd_find)
+
+    s = sub.add_parser("state", help="live state: exact entity ids, or filter by --area/--domain/terms")
+    s.add_argument("entities", nargs="*")
+    s.add_argument("--domain", "-d")
+    s.add_argument("--area", "-a")
+    s.add_argument("--verbose", "-v", action="store_true", help="include attributes")
+    s.set_defaults(fn=cmd_state)
+
+    s = sub.add_parser("call", help="call a service, e.g. `ha call light.turn_on light.kitchen --data '{\"brightness_pct\":50}'`")
+    s.add_argument("service")
+    s.add_argument("entities", nargs="*")
+    s.add_argument("--data", help="JSON service data")
+    s.add_argument("--response", action="store_true", help="for services that return data")
+    s.set_defaults(fn=cmd_call)
+
+    s = sub.add_parser("services", help="list services (from cache); with domain shows fields")
+    s.add_argument("domain", nargs="?")
+    s.set_defaults(fn=cmd_services)
+
+    s = sub.add_parser("history", help="state history")
+    s.add_argument("entities", nargs="+")
+    s.add_argument("--hours", type=float, default=24)
+    s.add_argument("--max", type=int, default=50, help="max points per entity (downsampled)")
+    s.set_defaults(fn=cmd_history)
+
+    s = sub.add_parser("logbook", help="recent logbook events")
+    s.add_argument("entity", nargs="?")
+    s.add_argument("--hours", type=float, default=6)
+    s.add_argument("--max", type=int, default=50)
+    s.set_defaults(fn=cmd_logbook)
+
+    s = sub.add_parser("template", help="render a Jinja template on HA")
+    s.add_argument("template")
+    s.set_defaults(fn=cmd_template)
+
+    s = sub.add_parser("api", help="raw REST call, e.g. `ha api get /api/config`")
+    s.add_argument("method")
+    s.add_argument("path")
+    s.add_argument("body", nargs="?")
+    s.set_defaults(fn=cmd_api)
+
+    args = p.parse_args()
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()

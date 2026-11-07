@@ -1,0 +1,15 @@
+{
+  "name": "tanaev",
+  "description": "Pavlo Tanaiev's Claude Code plugins",
+  "owner": {
+    "name": "Pavlo Tanaiev",
+    "url": "https://github.com/tanaev"
+  },
+  "plugins": [
+    {
+      "name": "home-assistant",
+      "source": "./plugins/home-assistant",
+      "description": "Query and control Home Assistant from Claude Code, with guided setup"
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "name": "home-assistant",
+  "displayName": "Home Assistant",
+  "version": "1.0.0",
+  "description": "Let Claude query and control your Home Assistant: devices, history, automations, YAML (pull/diff/push with rollback) and dashboards. Guided setup via /home-assistant:setup.",
+  "author": { "name": "Pavlo Tanaiev", "url": "https://github.com/tanaev" },
+  "repository": "https://github.com/tanaev/claude-plugins",
+  "license": "MIT",
+  "keywords": ["home-assistant", "smart-home", "iot", "automation"]
+}
