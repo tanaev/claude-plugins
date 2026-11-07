@@ -1,72 +1,74 @@
-# Home Assistant для Claude Code
+# Home Assistant for Claude Code
 
-Плагін, з яким Claude керує твоїм Home Assistant звичайною мовою: «що зараз увімкнено?», «яка температура в спальні?», «зроби автоматизацію…», «додай картку на дашборд». Доступ налаштовується один раз, і пояснювати його щоразу не треба.
+**English** · [Українська](README.uk.md)
 
-## Встановлення
+A plugin that lets Claude manage your Home Assistant in plain language: "what's on right now?", "what's the temperature in the bedroom?", "make an automation…", "add a card to the dashboard". You set up access once and never explain it again.
 
-У Claude Code:
+## Install
+
+In Claude Code:
 ```
 /plugin marketplace add tanaev/claude-plugins
 /plugin install home-assistant@tanaev
 ```
-Перезапусти Claude Code, потім напиши:
+Restart Claude Code, then type:
 ```
 /home-assistant:setup
 ```
-або просто «підключи мій Home Assistant». Claude проведе тебе крок за кроком. Нижче те саме, щоб знати наперед.
+or just "connect my Home Assistant". Claude walks you through it step by step. The rest of this page covers the same ground, so you know what to expect.
 
-## Що знадобиться
+## What you need
 
-| Що | Де взяти | Обов'язково? |
+| What | Where to get it | Required? |
 |---|---|---|
-| **Python 3.8+** | на macOS і Linux зазвичай уже є (`python3 --version`) | так |
-| **Адреса HA** | та, що відкриваєш у браузері: `http://homeassistant.local:8123`, `http://192.168.x.x:8123`, Nabu Casa чи свій домен | так |
-| **Токен доступу** | HA → натисни своє ім'я внизу бічної панелі → вкладка **Security** → **Long-lived access tokens** → **Create token** → назви `Claude` → скопіюй. Потрібен користувач-**адміністратор** | так |
-| **SSH-доступ до конфігів** | add-on **Advanced SSH & Web Terminal** (Settings → Add-ons → Add-on Store) з твоїм публічним SSH-ключем. Ключ і `~/.ssh/config` Claude налаштує сам | ні, лише для редагування YAML |
+| **Python 3.8+** | usually already there on macOS and Linux (`python3 --version`) | yes |
+| **HA address** | the one you open in a browser: `http://homeassistant.local:8123`, `http://192.168.x.x:8123`, Nabu Casa or your own domain | yes |
+| **Access token** | in HA, click your name at the bottom of the sidebar → **Security** tab → **Long-lived access tokens** → **Create token** → name it `Claude` → copy it. Use an **administrator** account | yes |
+| **SSH access to the config** | the **Advanced SSH & Web Terminal** add-on (Settings → Add-ons → Add-on Store) with your public SSH key. Claude sets up the key and `~/.ssh/config` itself | no, only for editing YAML |
 
-**Токен не вставляй у чат.** Скопіюй його і скажи Claude «скопіював». Claude прочитає токен прямо з буфера обміну, перевірить і збереже в Keychain (macOS) або libsecret (Linux). Сам токен Claude не побачить.
+**Don't paste the token into the chat.** Copy it and tell Claude "copied". Claude reads the token straight from the clipboard, checks it against HA and saves it in the Keychain (macOS) or libsecret (Linux). Claude never sees the token itself.
 
-Без SSH працює майже все: стани, керування, історія, хелпери, дашборди. SSH потрібен тільки для `automations.yaml`, `configuration.yaml` і пакетів у YAML.
+Almost everything works without SSH: states, control, history, helpers and dashboards. SSH is needed only for `automations.yaml`, `configuration.yaml` and YAML packages.
 
-## Що де лежить
+## Where things live
 
-Усе твоє зберігається в `~/HomeAssistant` (іншу папку можна задати через `HA_HOME`):
+Everything that's yours is kept in `~/HomeAssistant` (set `HA_HOME` to use another folder):
 ```
 ~/HomeAssistant/
-├── config.json     ← URL, ssh-хост, шлях до конфігів
-├── notes.md        ← твої нотатки: як що називається, особливості пристроїв (Claude читає і доповнює)
-├── data/           ← список пристроїв (summary.md, inventory.md), резервні копії перед кожним push
-├── config/         ← локальна копія YAML з HA
-└── dashboards/     ← конфіги дашбордів
+├── config.json     ← URL, SSH host, config path
+├── notes.md        ← your notes: what things are called, device quirks (Claude reads and adds to it)
+├── data/           ← device list (summary.md, inventory.md), backups taken before each push
+├── config/         ← local copy of HA's YAML
+└── dashboards/     ← dashboard configs
 ```
 
-## Безпека
+## Safety
 
-- **Що Claude робить без питань:** читає дані, вмикає й вимикає світло та медіа.
-- **Що тільки з підтвердженням:** замки, ворота, сигналізація, великі зміни опалення, завантаження змінених конфігів чи дашбордів, рестарт HA. Кожен виклик сервісу Claude Code додатково підтверджує сам, якщо ти не дозволив інакше.
-- **Як `push` захищає конфіги:** перед завантаженням зберігає копію файлів з HA. Після завантаження запускає перевірку конфігурації. Якщо перевірка не пройшла, автоматично повертає старі файли.
-- **Що не потрапляє до Claude:** `secrets.yaml` і `zigbee2mqtt/` ніколи не стягуються.
-- **Як забрати доступ:** видали токен у профілі HA.
+- **What Claude does without asking:** reads data, turns lights and media on and off.
+- **What needs your confirmation:** locks, gates, alarms, big heating changes, uploading changed config or dashboards, restarting HA. Claude Code also asks before each service call unless you've allowed it.
+- **How `push` protects your config:** before uploading, it saves a copy of the files on HA. After uploading, it runs HA's config check. If the check fails, it puts the old files back automatically.
+- **What never reaches Claude:** `secrets.yaml` and `zigbee2mqtt/` are never pulled.
+- **How to revoke access:** delete the token in your HA profile.
 
-## Команди `ha`
+## `ha` commands
 
-Claude викликає їх сам, але знадобляться, якщо захочеш щось перевірити вручну:
+Claude runs these itself, but they're handy if you want to check something by hand:
 
-| Команда | Що робить |
+| Command | What it does |
 |---|---|
-| `ha doctor` | що налаштовано і що працює |
-| `ha find кухня світло` / `ha state light.x` | пошук пристроїв / поточний стан |
-| `ha call light.turn_on light.x --data '{"brightness_pct":40}'` | виклик сервісу |
-| `ha history sensor.x --hours 48`, `ha logbook` | історія |
-| `ha pull` → правки → `ha diff` → `ha push` | редагування YAML |
-| `ha dashboard pull/diff/push [name]` | дашборди |
-| `ha api …`, `ha ws …` | будь-який запит до REST чи WebSocket API |
+| `ha doctor` | what's configured and what works |
+| `ha find kitchen light` / `ha state light.x` | find devices / current state |
+| `ha call light.turn_on light.x --data '{"brightness_pct":40}'` | call a service |
+| `ha history sensor.x --hours 48`, `ha logbook` | history |
+| `ha pull` → edit → `ha diff` → `ha push` | edit YAML |
+| `ha dashboard pull/diff/push [name]` | dashboards |
+| `ha api …`, `ha ws …` | any REST or WebSocket API request |
 
-## Проблеми
+## Troubleshooting
 
-| Симптом | Що робити |
+| Symptom | What to do |
 |---|---|
-| `ha: command not found` | `/plugin` → увімкни `home-assistant`, перезапусти Claude Code |
-| `cannot reach …` | перевір адресу; домашня адреса не працює поза домом без VPN |
-| `token rejected` / HTTP 401 | створи новий токен і скажи Claude «онови токен» |
-| `ssh failed` | add-on запущений? ключ доданий? ти вдома або на VPN? |
+| `ha: command not found` | `/plugin` → enable `home-assistant`, restart Claude Code |
+| `cannot reach …` | check the address; a home address won't work away from home without a VPN |
+| `token rejected` / HTTP 401 | create a new token and tell Claude "update the token" |
+| `ssh failed` | is the add-on running? is the key added? are you at home or on VPN? |

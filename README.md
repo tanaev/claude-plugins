@@ -1,11 +1,11 @@
 # tanaev / claude-plugins
 
-Плагіни для [Claude Code](https://claude.com/claude-code).
+Plugins for [Claude Code](https://claude.com/claude-code). · Плагіни для Claude Code.
 
 ```
 /plugin marketplace add tanaev/claude-plugins
 ```
 
-| Плагін | Що робить |
+| Plugin | What it does |
 |---|---|
-| [home-assistant](plugins/home-assistant) | Керування Home Assistant з Claude: пристрої, історія, автоматизації, YAML, дашборди. Налаштування через `/home-assistant:setup` |
+| [home-assistant](plugins/home-assistant) | Control Home Assistant from Claude: devices, history, automations, YAML, dashboards. Guided setup via `/home-assistant:setup` · [Українською](plugins/home-assistant/README.uk.md) |

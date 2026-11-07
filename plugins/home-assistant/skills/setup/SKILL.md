@@ -81,7 +81,7 @@ Offer to allow read-only commands without prompts. With their OK, merge these in
 1. `ha doctor`: everything they set up should be `ok`.
 2. Read `~/HomeAssistant/data/summary.md` and give a short overview: HA version, areas, how many lights, sensors and automations.
 3. Ask them to tell you house-specific facts worth remembering (what an oddly named switch controls, nicknames for rooms), and put them in `notes.md`.
-4. Show a few things to try: "що зараз увімкнено?", "яка температура в спальні?", "зроби автоматизацію: світло в коридорі по руху після заходу сонця", "додай на дашборд картку з …".
+4. Show a few things to try, in the user's language, e.g. "what's on right now?", "what's the temperature in the bedroom?", "make an automation: hallway light on motion after sunset", "add a card with … to the dashboard".
 
 ## Changing things later
 - New token or new URL: `ha setup --url <url> --token-from-clipboard`.
